@@ -18,22 +18,24 @@ It reads two files produced by VASP:
 
   * ML_AB   -- the training data file (see https://vasp.at/wiki/ML_AB). Used only
                to recover, for every configuration and *in the same order as ML_REG*:
-                   - the "System name"  -> used to group/colour the points
+                   - the "System name"  -> used to group the points
                    - "The number of atoms" (N) -> used to slice the flat force list
                                                    into per-structure blocks
 
-The energies in ML_REG are *total* energies, so different-sized systems live at
-very different values. By default we plot them per atom (eV/atom), which puts every
-system on a comparable scale and matches the usual MLFF error metric.
+Output: ONE energy panel and ONE force panel *per system* (grouped by System name),
+so every system can be inspected on its own zoomed axes. The number of images is
+therefore 2 * (number of distinct systems). Each panel's title reports its RMSE.
+Files are named   parity_energy_<system>.png   and   parity_forces_<system>.png .
 
-Output: two figures, each overlaying all systems with a distinct colour and a legend
-that reports the per-system RMSE:
-    * parity_energy.png  -- reference vs. ML energy
-    * parity_forces.png  -- reference vs. ML force components
+The energies in ML_REG are *total* energies, so different-sized systems live at
+very different values. By default we plot them per atom (eV/atom), which is the
+usual MLFF error metric.
 
 All settings are hardcoded in the CONFIGURATION block below -- edit them there.
 """
 
+import os
+import re
 import sys
 from collections import OrderedDict
 
@@ -51,9 +53,10 @@ import matplotlib.pyplot as plt
 ML_REG_FILE = "ML_REG"
 ML_AB_FILE = "ML_AB"
 
-# --- output files ------------------------------------------------------------------
-ENERGY_PLOT_FILE = "parity_energy.png"
-FORCES_PLOT_FILE = "parity_forces.png"
+# --- output ------------------------------------------------------------------------
+OUTPUT_DIR = "parity_plots"                     # created if missing
+ENERGY_FILE_TEMPLATE = "parity_energy_{system}.png"
+FORCES_FILE_TEMPLATE = "parity_forces_{system}.png"
 
 # --- energy handling ---------------------------------------------------------------
 # ML_REG stores TOTAL energies (eV). With True, energies are divided by the number
@@ -61,16 +64,17 @@ FORCES_PLOT_FILE = "parity_forces.png"
 ENERGY_PER_ATOM = True
 
 # --- figure appearance -------------------------------------------------------------
-FIG_SIZE = (7.5, 7.0)      # inches, per figure
+FIG_SIZE = (6.5, 6.2)      # inches, per panel
 DPI = 200
-MARKER_SIZE_ENERGY = 26    # scatter point size for the energy plot (617 pts here)
-MARKER_SIZE_FORCE = 6      # scatter point size for the force plot (~300k pts here)
+MARKER_SIZE_ENERGY = 32    # scatter point size for the energy panels
+MARKER_SIZE_FORCE = 6      # scatter point size for the force panels (dense)
 POINT_ALPHA_ENERGY = 0.85
-POINT_ALPHA_FORCE = 0.35   # forces have many points -> use transparency
+POINT_ALPHA_FORCE = 0.30   # forces have many points -> use transparency
 MARKER_EDGE_WIDTH = 0.3    # thin dark edge keeps light colours visible on white
 
-# Colour-blind-safe categorical palette (re-ordered Okabe-Ito). Assigned to system
-# names in fixed order; if there are more systems than colours it cycles.
+# Colour-blind-safe categorical palette (re-ordered Okabe-Ito). Each system keeps
+# the same colour across its energy and force panels; cycles if there are more
+# systems than colours.
 PALETTE = [
     "#0072B2",  # blue
     "#E69F00",  # orange
@@ -198,73 +202,49 @@ def color_map(system_names):
     )
 
 
-def make_parity_figure(groups, order, colors, title, axis_label,
-                       rmse_unit, rmse_scale, rmse_fmt, marker_size,
-                       alpha, out_file):
-    """Draw one parity plot.
+def safe_filename(name):
+    """Make a system name safe to use in a file name."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name)
 
-    groups     : dict name -> (ref_array, ml_array)
-    order      : iterable of names giving legend/plot order
-    colors     : dict name -> colour
-    rmse_scale : multiply RMSE (in axis units) to get it in rmse_unit
-    """
+
+def make_panel(ref, ml, color, system, kind_title, axis_label,
+               rmse_value, rmse_unit, rmse_fmt, marker_size, alpha, out_file):
+    """Draw one parity panel for a single system (single data series)."""
     fig, ax = plt.subplots(figsize=FIG_SIZE)
 
-    all_vals = []
-    for name in order:
-        ref, ml = groups[name]
-        all_vals.append(ref)
-        all_vals.append(ml)
-    all_vals = np.concatenate(all_vals)
-    lo, hi = all_vals.min(), all_vals.max()
+    both = np.concatenate([ref, ml])
+    lo, hi = both.min(), both.max()
     pad = 0.03 * (hi - lo) if hi > lo else 1.0
     lo, hi = lo - pad, hi + pad
 
-    # y = x reference line (drawn first, sits underneath the points)
-    ax.plot([lo, hi], [lo, hi], "--", color=DIAGONAL_COLOR, lw=1.2,
-            zorder=1, label="_nolegend_")
+    # y = x reference line (drawn first, underneath the points)
+    ax.plot([lo, hi], [lo, hi], "--", color=DIAGONAL_COLOR, lw=1.2, zorder=1)
 
-    # overall RMSE across every point, shown in the corner
-    ref_all = np.concatenate([groups[n][0] for n in order])
-    ml_all = np.concatenate([groups[n][1] for n in order])
-    overall = rmse(ref_all, ml_all) * rmse_scale
-
-    for name in order:
-        ref, ml = groups[name]
-        r = rmse(ref, ml) * rmse_scale
-        label = f"{name}  (RMSE {rmse_fmt.format(r)} {rmse_unit}, n={ref.size})"
-        ax.scatter(
-            ref, ml,
-            s=marker_size, alpha=alpha, color=colors[name],
-            edgecolors="black", linewidths=MARKER_EDGE_WIDTH,
-            label=label, rasterized=(ref.size > 5000), zorder=2,
-        )
+    ax.scatter(
+        ref, ml,
+        s=marker_size, alpha=alpha, color=color,
+        edgecolors="black", linewidths=MARKER_EDGE_WIDTH,
+        rasterized=(ref.size > 5000), zorder=2,
+    )
 
     ax.set_xlim(lo, hi)
     ax.set_ylim(lo, hi)
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel(f"Reference / DFT  {axis_label}")
     ax.set_ylabel(f"ML predicted  {axis_label}")
-    ax.set_title(title)
+    ax.set_title(f"{system}  —  {kind_title}")
     ax.grid(True, color="#dddddd", lw=0.6, zorder=0)
     ax.text(
         0.03, 0.97,
-        f"Overall RMSE: {rmse_fmt.format(overall)} {rmse_unit}",
+        f"RMSE {rmse_fmt.format(rmse_value)} {rmse_unit}\nn = {ref.size}",
         transform=ax.transAxes, va="top", ha="left", fontsize=10,
         bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="#cccccc", alpha=0.9),
     )
-    leg = ax.legend(
-        loc="lower right", frameon=True, fontsize=8.5,
-        title="System  (per-structure grouping)", title_fontsize=9,
-        markerscale=1.6 if marker_size < 12 else 1.0,
-    )
-    leg.get_frame().set_edgecolor("#cccccc")
 
     fig.tight_layout()
     fig.savefig(out_file, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"  wrote {out_file}")
-    return overall
 
 # =====================================================================================
 # main
@@ -276,7 +256,9 @@ def main():
     names = [c[0] for c in configs]
     atoms = np.array([c[1] for c in configs], dtype=int)
     n_config = len(configs)
-    print(f"  {n_config} configurations, {len(unique_in_order(names))} distinct systems")
+    colors = color_map(names)
+    order = list(colors.keys())                    # first-appearance order
+    print(f"  {n_config} configurations, {len(order)} distinct systems")
 
     print(f"Reading ML_REG : {ML_REG_FILE}")
     energies, forces, stress = parse_ml_reg(ML_REG_FILE)
@@ -295,9 +277,6 @@ def main():
             f"3*sum(N) = {expected_force_rows}. The two files must match."
         )
 
-    colors = color_map(names)
-    order = list(colors.keys())  # first-appearance order
-
     # ---- ENERGIES: one point per configuration ------------------------------------
     e_ref = energies[:, 0].copy()
     e_ml = energies[:, 1].copy()
@@ -314,6 +293,7 @@ def main():
         energy_rmse_scale = 1.0
         energy_rmse_fmt = "{:.4f}"
 
+    # group energy points by system name
     energy_groups = {}
     for name in order:
         mask = np.array([nm == name for nm in names])
@@ -335,28 +315,39 @@ def main():
         for name in order
     }
 
-    # ---- draw ---------------------------------------------------------------------
-    print("Plotting:")
-    e_overall = make_parity_figure(
-        energy_groups, order, colors,
-        title="Energy parity  (ML force field vs. DFT)",
-        axis_label=energy_axis_label,
-        rmse_unit=energy_rmse_unit, rmse_scale=energy_rmse_scale,
-        rmse_fmt=energy_rmse_fmt, marker_size=MARKER_SIZE_ENERGY,
-        alpha=POINT_ALPHA_ENERGY, out_file=ENERGY_PLOT_FILE,
-    )
-    f_overall = make_parity_figure(
-        force_groups, order, colors,
-        title="Force-component parity  (ML force field vs. DFT)",
-        axis_label="force (eV/Å)",
-        rmse_unit="eV/Å", rmse_scale=1.0,
-        rmse_fmt="{:.4f}", marker_size=MARKER_SIZE_FORCE,
-        alpha=POINT_ALPHA_FORCE, out_file=FORCES_PLOT_FILE,
-    )
+    # ---- draw one energy panel and one force panel per system ---------------------
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    print(f"Plotting into '{OUTPUT_DIR}/' ({2 * len(order)} images):")
+    summary = []
+    for name in order:
+        color = colors[name]
+        safe = safe_filename(name)
 
-    print("\nSummary (overall RMSE):")
-    print(f"  energy : {energy_rmse_fmt.format(e_overall)} {energy_rmse_unit}")
-    print(f"  forces : {f_overall:.4f} eV/Å")
+        e_r, e_m = energy_groups[name]
+        e_rmse = rmse(e_r, e_m) * energy_rmse_scale
+        make_panel(
+            e_r, e_m, color, name, "Energy parity (ML vs. DFT)",
+            energy_axis_label, e_rmse, energy_rmse_unit, energy_rmse_fmt,
+            MARKER_SIZE_ENERGY, POINT_ALPHA_ENERGY,
+            os.path.join(OUTPUT_DIR, ENERGY_FILE_TEMPLATE.format(system=safe)),
+        )
+
+        f_r, f_m = force_groups[name]
+        f_rmse = rmse(f_r, f_m)
+        make_panel(
+            f_r, f_m, color, name, "Force-component parity (ML vs. DFT)",
+            "force (eV/Å)", f_rmse, "eV/Å", "{:.4f}",
+            MARKER_SIZE_FORCE, POINT_ALPHA_FORCE,
+            os.path.join(OUTPUT_DIR, FORCES_FILE_TEMPLATE.format(system=safe)),
+        )
+        summary.append((name, e_r.size, e_rmse, f_r.size, f_rmse))
+
+    # ---- per-system summary table -------------------------------------------------
+    print("\nPer-system RMSE:")
+    print(f"  {'system':<16} {'n_struct':>8}  {'E-RMSE':>12}   {'n_force':>9}  {'F-RMSE (eV/Å)':>14}")
+    for name, ne, er, nf, fr in summary:
+        print(f"  {name:<16} {ne:>8}  {energy_rmse_fmt.format(er):>8} {energy_rmse_unit:<4}"
+              f"   {nf:>9}  {fr:>14.4f}")
 
 
 if __name__ == "__main__":
